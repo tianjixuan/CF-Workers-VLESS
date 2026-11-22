@@ -195,6 +195,81 @@ async function resetConfig(env) {
     memoryConfigCache = null;
     memoryConfigCacheTime = 0;
 }
+
+// ------------------------- 鉴权工具：签名令牌 / 恒定时间比较 / 登录限流 -------------------------
+const AUTH_TTL_SEC = 86400;
+function safeEqual(a, b) {
+    a = String(a ?? ''); b = String(b ?? '');
+    const len = Math.max(a.length, b.length);
+    let diff = a.length ^ b.length;
+    for (let i = 0; i < len; i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+    return diff === 0;
+}
+async function hmacHex(secret, msg) {
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(String(secret)), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg)));
+    return Array.from(sig, b => b.toString(16).padStart(2, '0')).join('');
+}
+// 令牌格式：exp.sig，sig = HMAC(密码, role|exp)；改密码后旧令牌自动失效
+async function makeAuthToken(role, secret) {
+    const exp = Math.floor(Date.now() / 1000) + AUTH_TTL_SEC;
+    return `${exp}.${await hmacHex(secret, `${role}|${exp}`)}`;
+}
+async function verifyAuthToken(token, role, secret) {
+    if (!token || !secret) return false;
+    const dot = token.indexOf('.');
+    if (dot <= 0) return false;
+    const exp = parseInt(token.slice(0, dot), 10);
+    if (!exp || exp < Math.floor(Date.now() / 1000)) return false;
+    return safeEqual(token.slice(dot + 1), await hmacHex(secret, `${role}|${exp}`));
+}
+function authCookie(name, value, secureFlag, maxAge = AUTH_TTL_SEC) {
+    return `${name}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Strict${secureFlag}`;
+}
+// 登录限流（按 IP，单实例内存）：5 次失败锁定 15 分钟
+const loginFails = new Map();
+const LOGIN_MAX_FAILS = 5, LOGIN_LOCK_MS = 15 * 60 * 1000;
+function clientIp(request) {
+    return request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || 'unknown';
+}
+function isLoginLocked(request) {
+    const ip = clientIp(request);
+    const r = loginFails.get(ip);
+    if (!r || !r.until) return false;
+    if (r.until > Date.now()) return true;
+    loginFails.delete(ip);
+    return false;
+}
+function recordLoginFail(request) {
+    const ip = clientIp(request);
+    const r = loginFails.get(ip) || { n: 0, until: 0 };
+    r.n++;
+    if (r.n >= LOGIN_MAX_FAILS) { r.until = Date.now() + LOGIN_LOCK_MS; r.n = 0; }
+    loginFails.set(ip, r);
+    if (loginFails.size > 2000) loginFails.delete(loginFails.keys().next().value);
+}
+function clearLoginFail(request) { loginFails.delete(clientIp(request)); }
+// 校验后台权限：x-password 头（脚本调用）或签名 Cookie
+async function isAdminAuthed(request, config) {
+    const hdr = request.headers.get('x-password');
+    if (hdr !== null) return safeEqual(hdr, config.adminPassword);
+    return verifyAuthToken(getCookieValue(request.headers.get('Cookie'), 'cf_admin_pwd'), 'admin', config.adminPassword);
+}
+function maskSecret(v) { v = String(v || ''); return v ? (v.length <= 4 ? '****' : v.slice(0, 2) + '****' + v.slice(-2)) : ''; }
+function maskProxyCred(addr) { return String(addr).replace(/(\/\/)([^@\/]+)@/, (m, a) => `${a}****@`); }
+function sanitizeConfig(config) {
+    return {
+        ...config,
+        password: maskSecret(config.password),
+        adminPassword: maskSecret(config.adminPassword),
+        yourUUID: maskSecret(config.yourUUID),
+        ssPsk: maskSecret(config.ssPsk),
+        landingProxy: maskProxyCred(config.landingProxy || ''),
+        landingProxies: (config.landingProxies || []).map(maskProxyCred),
+        proxyIPs: (config.proxyIPs || []).map(maskProxyCred)
+    };
+}
+
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 function closeSocketQuietly(socket) { 
@@ -1085,7 +1160,8 @@ function base64ToArray(b64Str) {
         }
         return { earlyData: bytes.buffer, error: null }; 
     } catch (error) { 
-        return { error }; 
+        // 非 base64（如普通子协议名）时视为无早期数据，不中断连接
+        return { error: null }; 
     }
 }
 
@@ -1233,10 +1309,6 @@ function parsePryAddress(serverStr) {
     return { type: 'direct', host: serverStr, port: 443 };
 }
 
-function isSpeedTestSite(hostname) {
-    // 允许测速站点正常通行，解除测速阻断以测得真实带宽
-    return false;
-}
 
 async function sha224(text) {
   const encoder = new TextEncoder();
@@ -1352,8 +1424,11 @@ export default {
             
             // 1. 后台配置 API: /api/config (需后台管理员密码 ADMIN 鉴权)
             if (pathname === '/api/config') {
-                const reqPassword = url.searchParams.get('password') || request.headers.get('x-password') || getCookieValue(request.headers.get('Cookie'), 'cf_admin_pwd');
-                if (reqPassword !== config.adminPassword) {
+                if (isLoginLocked(request)) {
+                    return new Response(JSON.stringify({ success: false, message: '尝试次数过多，请 15 分钟后再试' }), { status: 429, headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+                }
+                if (!(await isAdminAuthed(request, config))) {
+                    if (request.headers.get('x-password') !== null) recordLoginFail(request);
                     return new Response(JSON.stringify({ success: false, message: '后台管理鉴权失败，密码错误' }), {
                         status: 401,
                         headers: { 'Content-Type': 'application/json; charset=utf-8' }
@@ -1389,7 +1464,7 @@ export default {
                         const finalProxyIPs = hasProxyInput ? newProxyIPs : config.proxyIPs;
                         const mainProxyIP = finalProxyIPs.length > 0 ? finalProxyIPs[0] : '';
 
-                        let newLandingProxies = [];
+                        let newLandingProxies = Array.isArray(config.landingProxies) ? [...config.landingProxies] : [];
                         if (typeof body.landingProxies === 'string') {
                             newLandingProxies = body.landingProxies.split(/[\r\n]+/).map(s => s.trim()).filter(Boolean);
                         } else if (Array.isArray(body.landingProxies)) {
@@ -1397,7 +1472,7 @@ export default {
                         } else if (typeof body.landingProxy === 'string') {
                             newLandingProxies = body.landingProxy.split(/[\r\n]+/).map(s => s.trim()).filter(Boolean);
                         }
-                        const mainLandingProxy = newLandingProxies.length > 0 ? newLandingProxies[0] : (body.landingProxy !== undefined ? String(body.landingProxy).trim() : '');
+                        const mainLandingProxy = newLandingProxies.length > 0 ? newLandingProxies[0] : '';
                         
                         const updatedConfig = {
                             yourUUID: (body.yourUUID && String(body.yourUUID).trim()) || config.yourUUID,
@@ -1423,7 +1498,7 @@ export default {
                         return new Response(JSON.stringify({ success: true, message: '配置已成功持久化保存到 Cloudflare KV！' }), {
                             headers: {
                                 'Content-Type': 'application/json; charset=utf-8',
-                                'Set-Cookie': `cf_admin_pwd=${encodeURIComponent(updatedConfig.adminPassword)}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax${secureFlag}`
+                                'Set-Cookie': authCookie('cf_admin_pwd', await makeAuthToken('admin', updatedConfig.adminPassword), secureFlag)
                             }
                         });
                     } catch (err) {
@@ -1433,7 +1508,7 @@ export default {
                         });
                     }
                 } else if (request.method === 'GET') {
-                    return new Response(JSON.stringify({ success: true, config, hasKV }), {
+                    return new Response(JSON.stringify({ success: true, config: sanitizeConfig(config), hasKV }), {
                         headers: { 'Content-Type': 'application/json; charset=utf-8' }
                     });
                 }
@@ -1441,8 +1516,11 @@ export default {
 
             // 2. 后台重置 API: /api/reset (需后台管理员密码 ADMIN 鉴权)
             if (pathname === '/api/reset' && request.method === 'POST') {
-                const reqPassword = url.searchParams.get('password') || request.headers.get('x-password') || getCookieValue(request.headers.get('Cookie'), 'cf_admin_pwd');
-                if (reqPassword !== config.adminPassword) {
+                if (isLoginLocked(request)) {
+                    return new Response(JSON.stringify({ success: false, message: '尝试次数过多，请 15 分钟后再试' }), { status: 429, headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+                }
+                if (!(await isAdminAuthed(request, config))) {
+                    if (request.headers.get('x-password') !== null) recordLoginFail(request);
                     return new Response(JSON.stringify({ success: false, message: '后台管理鉴权失败，密码错误' }), {
                         status: 401,
                         headers: { 'Content-Type': 'application/json; charset=utf-8' }
@@ -1457,9 +1535,7 @@ export default {
                 await resetConfig(env);
                 const resetCfg = await loadConfig(env);
                 const secureFlag = url.protocol === 'https:' ? '; Secure' : '';
-                const resetCookie = reqPassword === resetCfg.adminPassword
-                    ? `cf_admin_pwd=${encodeURIComponent(resetCfg.adminPassword)}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax${secureFlag}`
-                    : `cf_admin_pwd=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secureFlag}`;
+                const resetCookie = authCookie('cf_admin_pwd', await makeAuthToken('admin', resetCfg.adminPassword), secureFlag);
                 return new Response(JSON.stringify({ success: true, message: '已清除 KV 配置，恢复默认设置！' }), {
                     headers: {
                         'Content-Type': 'application/json; charset=utf-8',
@@ -1469,6 +1545,34 @@ export default {
             }
 
             // 3. WebSocket 连接
+
+            // 3. 登录：POST 表单提交密码，签发签名 Cookie 后 303 跳回
+            if (request.method === 'POST' && (pathname === '/' || pathname === '/admin' || pathname === '/admin/')) {
+                const isAdminLogin = pathname !== '/';
+                const secureFlag = url.protocol === 'https:' ? '; Secure' : '';
+                const host = request.headers.get('Host') || url.host;
+                if (isLoginLocked(request)) {
+                    return new Response('尝试次数过多，请 15 分钟后再试', { status: 429, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+                }
+                let pwd = '';
+                try {
+                    const ct = request.headers.get('Content-Type') || '';
+                    if (ct.includes('application/json')) pwd = String((await request.json()).password || '');
+                    else pwd = String((await request.formData()).get('password') || '');
+                } catch (e) {}
+                const secret = isAdminLogin ? config.adminPassword : config.password;
+                if (pwd && safeEqual(pwd, secret)) {
+                    clearLoginFail(request);
+                    const cookieName = isAdminLogin ? 'cf_admin_pwd' : 'cf_user_pwd';
+                    const token = await makeAuthToken(isAdminLogin ? 'admin' : 'user', secret);
+                    return new Response(null, { status: 303, headers: { 'Location': isAdminLogin ? '/admin' : '/', 'Set-Cookie': authCookie(cookieName, token, secureFlag), 'Cache-Control': 'no-store' } });
+                }
+                recordLoginFail(request);
+                return isAdminLogin
+                    ? getLoginPage(host, `https://${host}`, true, true)
+                    : getCamouflageProbePage(host, true, true);
+            }
+
             if (request.headers.get('Upgrade') === 'websocket') {
                 // 路径中 proxyip / fd (分流代理) / ld (落地代理) 提取 (支持 sstp://, turn://, socks5://, http(s)://)
                 let pathProxyIP = null;
@@ -1644,6 +1748,16 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
     serverSock.accept({ allowHalfOpen: true });
     serverSock.binaryType = 'arraybuffer';
     let remoteConnWrapper = { socket: null };
+    let cleanedUp = false;
+    const cleanupRemote = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        const rs = remoteConnWrapper.socket;
+        remoteConnWrapper.socket = null;
+        closeSocketQuietly(rs);
+    };
+    serverSock.addEventListener('close', cleanupRemote);
+    serverSock.addEventListener('error', cleanupRemote);
     let isDnsQuery = false;
     let isTrojan = false;
     let isTrojanUdp = false;
@@ -1683,6 +1797,7 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
     }
 
     const upQueue = mkQ(GRAIN_CFG.upPack);
+    let headPending = null;
     let isWriting = false;
 
     async function flushUpstream() {
@@ -1757,9 +1872,6 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
 
                     const { h: hostname, p: port, o: rawIndex, addressType } = addrInfo;
 
-                    if (isSpeedTestSite(hostname)) {
-                        throw new Error('Speedtest site is blocked');
-                    }
 
                     if (addressType === 2) { 
                         if (port === 53) isDnsQuery = true;
@@ -1778,15 +1890,23 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
                 return;
             }
 
+            // 首包缓冲：协议头被拆成多个 WebSocket 消息时先攒齐再解析
+            if (headPending) {
+                const cur = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+                const merged = new Uint8Array(headPending.length + cur.length);
+                merged.set(headPending); merged.set(cur, headPending.length);
+                chunk = merged;
+                headPending = null;
+            }
+            const isIncomplete = r => !!(r && r.hasError && /^(truncated|invalid s5 request data)/i.test(r.message || ''));
+            let vlsResult = null, trojanResult = null;
+
             // 2. 尝试 VLESS 协议解析 (同步字节比对，0 异步开销)
             if (!activeConfig.disablevless) {
-                const vlsResult = parseVLsPacketHeader(chunk, activeConfig.yourUUID, yourUUIDBytes);
+                vlsResult = parseVLsPacketHeader(chunk, activeConfig.yourUUID, yourUUIDBytes);
                 if (!vlsResult.hasError) {
                     const { addressType, port, hostname, rawIndex, version, isUDP } = vlsResult;
 
-                    if (isSpeedTestSite(hostname)) {
-                        throw new Error('Speedtest site is blocked');
-                    }
 
                     if (isUDP) {
                         if (port === 53) isDnsQuery = true;
@@ -1804,13 +1924,10 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
             // 3. 尝试 Trojan 协议解析 (复用预计算的 SHA-224 哈希)
             if (!activeConfig.disabletro) {
                 const expectedHash = (activeConfig.yourUUID === cachedUUIDStr && cachedTrojanHash) ? cachedTrojanHash : null;
-                const trojanResult = await parsetroHeader(chunk, activeConfig.yourUUID, expectedHash);
+                trojanResult = await parsetroHeader(chunk, activeConfig.yourUUID, expectedHash);
                 if (!trojanResult.hasError) {
                     isTrojan = true;
                     const { addressType, port, hostname, rawClientData, isUDP } = trojanResult;
-                    if (isSpeedTestSite(hostname)) {
-                        throw new Error('Speedtest site is blocked');
-                    }
                     if (isUDP) {
                         if (port === 53) {
                             isTrojanUdp = true;
@@ -1827,11 +1944,16 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
                 }
             }
 
-        throw new Error('Protocol parse error');
+            // 已启用的协议判定“数据还不完整”且累计不足 2KB，则继续等待下一个消息
+            if ((isIncomplete(vlsResult) || isIncomplete(trojanResult)) && chunk.byteLength < 2048) {
+                headPending = (chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk)).slice();
+                return;
+            }
+            throw new Error('Protocol parse error');
         },
     })).catch((err) => {
-        // console.error('Readable pipe error:', err);
-    });
+        closeSocketQuietly(serverSock);
+    }).finally(cleanupRemote);
 
     return new Response(null, { 
         status: 101, 
@@ -1842,7 +1964,7 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
 
 async function parsetroHeader(buffer, passwordPlainText, precomputedHash = null) {
   if (!buffer || buffer.byteLength < 64) {
-    return { hasError: true, message: "invalid data" };
+    return { hasError: true, message: "truncated header" };
   }
   const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
   if (u8[56] !== 0x0d || u8[57] !== 0x0a) {
@@ -2855,7 +2977,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 }
 
 function parseVLsPacketHeader(chunk, token, tokenBytes) {
-    if (!chunk || chunk.byteLength < 24) return { hasError: true, message: 'Invalid data' };
+    if (!chunk || chunk.byteLength < 24) return { hasError: true, message: 'Truncated header' };
     const chunkView = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
     const version = chunkView.subarray(0, 1);
     if (tokenBytes) {
@@ -3802,10 +3924,9 @@ function getCamouflageProbePage(url, showError = false, autoOpenLogin = false, s
         function closeAuth() { document.getElementById("auth-modal").style.display = "none"; }
         function submitAuth(e) {
             e.preventDefault();
-            const pwd = document.getElementById("auth-pwd").value;
-            const u = new URL(window.location);
-            u.searchParams.set("password", pwd);
-            window.location.href = u.toString();
+            const f = document.createElement('form'); f.method = 'POST'; f.action = window.location.pathname;
+            const i = document.createElement('input'); i.type = 'hidden'; i.name = 'password'; i.value = document.getElementById("auth-pwd").value;
+            f.appendChild(i); document.body.appendChild(f); f.submit();
         }
         let tapCnt = 0, tapTimer = 0;
         function handleSecretTap() {
@@ -3839,19 +3960,10 @@ async function getNodesPage(request, validSSPath, config, hasKV) {
 	const secureFlag = urlObj.protocol === 'https:' ? '; Secure' : '';
 	const wantLoginModal = urlObj.searchParams.has('login');
 	if (urlObj.searchParams.get('logout') === '1') {
-		return getCamouflageProbePage(url, false, false, `cf_user_pwd=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secureFlag}`);
+		return getCamouflageProbePage(url, false, false, `cf_user_pwd=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict${secureFlag}`);
 	}
-	const providedPassword = urlObj.searchParams.get('password');
-	if (providedPassword !== null) {
-		if (providedPassword === config.password) {
-			const setCookie = `cf_user_pwd=${encodeURIComponent(providedPassword)}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax${secureFlag}`;
-			return await getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, setCookie);
-		} else {
-			return getCamouflageProbePage(url, true, true);
-		}
-	}
-	const cookiePassword = getCookieValue(request.headers.get('Cookie'), 'cf_user_pwd');
-	if (cookiePassword && cookiePassword === config.password) {
+	const userToken = getCookieValue(request.headers.get('Cookie'), 'cf_user_pwd');
+	if (await verifyAuthToken(userToken, 'user', config.password)) {
 		return await getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, null);
 	}
 	return getCamouflageProbePage(url, false, wantLoginModal);
@@ -3871,19 +3983,10 @@ async function getAdminPage(request, validSSPath, config, hasKV) {
 	const urlObj = new URL(request.url);
 	const secureFlag = urlObj.protocol === 'https:' ? '; Secure' : '';
 	if (urlObj.searchParams.get('logout') === '1') {
-		return getLoginPage(url, baseUrl, false, true, `cf_admin_pwd=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secureFlag}`);
+		return getLoginPage(url, baseUrl, false, true, `cf_admin_pwd=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict${secureFlag}`);
 	}
-	const providedPassword = urlObj.searchParams.get('password');
-	if (providedPassword !== null) {
-		if (providedPassword === config.adminPassword) {
-			const setCookie = `cf_admin_pwd=${encodeURIComponent(providedPassword)}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax${secureFlag}`;
-			return await getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, setCookie);
-		} else {
-			return getLoginPage(url, baseUrl, true, true);
-		}
-	}
-	const cookiePassword = getCookieValue(request.headers.get('Cookie'), 'cf_admin_pwd');
-	if (cookiePassword && cookiePassword === config.adminPassword) {
+	const adminToken = getCookieValue(request.headers.get('Cookie'), 'cf_admin_pwd');
+	if (await verifyAuthToken(adminToken, 'admin', config.adminPassword)) {
 		return await getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, null);
 	}
 	return getLoginPage(url, baseUrl, false, true);
@@ -4084,11 +4187,9 @@ function getLoginPage(url, baseUrl, showError = false, isAdmin = false, setCooki
         }
         function handleLogin(event) {
             event.preventDefault();
-            const password = document.getElementById('password').value;
-            const currentUrl = new URL(window.location);
-            currentUrl.searchParams.delete('logout');
-            currentUrl.searchParams.set('password', password);
-            window.location.href = currentUrl.toString();
+            const f = document.createElement('form'); f.method = 'POST'; f.action = window.location.pathname;
+            const i = document.createElement('input'); i.type = 'hidden'; i.name = 'password'; i.value = document.getElementById('password').value;
+            f.appendChild(i); document.body.appendChild(f); f.submit();
         }
     </script>
 </body>
@@ -5497,7 +5598,7 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
     </div>
     
     <script>
-        let currentAdminPassword = ${escJsStr(config.adminPassword)};
+        let currentAdminPassword = '';
 
         function switchTab(tabName) {
             document.querySelectorAll('.nav-tab').forEach(el => el.classList.remove('active'));
@@ -5558,7 +5659,7 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
             };
 
             try {
-                const resp = await fetch('/api/config?password=' + encodeURIComponent(currentAdminPassword), {
+                const resp = await fetch('/api/config', { credentials: 'same-origin',
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
@@ -5566,9 +5667,6 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
                 const res = await resp.json();
                 if (res.success) {
                     showToast(res.message || '配置已成功保存到 KV！');
-                    if (newAdminPwd && newAdminPwd !== currentAdminPassword) {
-                        currentAdminPassword = newAdminPwd;
-                    }
                     setTimeout(() => { window.location.reload(); }, 1200);
                 } else {
                     alert('保存失败: ' + (res.message || '未知错误'));
@@ -5583,7 +5681,7 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
                 return;
             }
             try {
-                const resp = await fetch('/api/reset?password=' + encodeURIComponent(currentAdminPassword), {
+                const resp = await fetch('/api/reset', { credentials: 'same-origin',
                     method: 'POST'
                 });
                 const res = await resp.json();
