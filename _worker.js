@@ -5,12 +5,13 @@
 // UUID     | uuid     UUID
 // DISABLE_TROJAN | 是否关闭Trojan, 设置为true时关闭，false开启，默认开启 
 // DISABLE_SS     | 是否关闭Shadowsocks, 设置为true时关闭，false开启，默认开启
-// SSPATH   | sspath   Shadowsocks验证路径, 为空则使用UUID作为验证路径
+// SSPATH   | sspath   Shadowsocks验证路径, 默认 fengyue
+// TOKEN    | SUB_TOKEN 订阅令牌, 同时作为首页登录凭据 (PASSWORD 已移除)
 
 import { connect } from 'cloudflare:sockets';
 
 const DEFAULT_CONFIG = {
-    subPath: 'link',
+    subPath: 'sub',
     password: '123456',
     adminPassword: 'admin',
     proxyIP: 'ProxyIP.CMLiussss.net',
@@ -23,7 +24,7 @@ const DEFAULT_CONFIG = {
     disabless: false,
     ssMethod: 'aes-256-gcm',
     ssPsk: '',
-    SSpath: '',
+    SSpath: 'fengyue',
     cfip: [],
 
 
@@ -77,7 +78,6 @@ async function loadConfig(env) {
     // 1. 环境变量覆盖
     if (env) {
         if (env.UUID || env.uuid || env.AUTH) config.yourUUID = env.UUID || env.uuid || env.AUTH;
-        if (env.PASSWORD || env.PASSWD || env.password) config.password = env.PASSWORD || env.PASSWD || env.password;
         if (env.ADMIN || env.admin) config.adminPassword = env.ADMIN || env.admin;
         if (env.SUB_PATH || env.subpath) config.subPath = env.SUB_PATH || env.subpath;
         if (env.SUB_TOKEN || env.sub_token || env.TOKEN || env.token) config.subToken = String(env.SUB_TOKEN || env.sub_token || env.TOKEN || env.token).trim();
@@ -128,7 +128,6 @@ async function loadConfig(env) {
             if (kvData && typeof kvData === 'object') {
                 if (kvData.yourUUID) config.yourUUID = String(kvData.yourUUID).trim();
                 if (kvData.subToken) config.subToken = String(kvData.subToken).trim();
-                if (kvData.password) config.password = String(kvData.password).trim();
                 if (kvData.adminPassword) config.adminPassword = String(kvData.adminPassword).trim();
                 else if (kvData.ADMIN) config.adminPassword = String(kvData.ADMIN).trim();
                 if (kvData.subPath !== undefined && kvData.subPath !== null) config.subPath = String(kvData.subPath).trim();
@@ -169,10 +168,10 @@ async function loadConfig(env) {
         }
     }
 
-    if (config.subPath === 'link' || config.subPath === '') {
-        config.subPath = config.yourUUID;
-    }
-    
+    if (!config.subPath) config.subPath = 'sub';
+    if (!config.SSpath) config.SSpath = 'fengyue';
+
+
     memoryConfigCache = config;
     memoryConfigCacheTime = now;
     return config;
@@ -266,7 +265,6 @@ function maskProxyCred(addr) { return String(addr).replace(/(\/\/)([^@\/]+)@/, (
 function sanitizeConfig(config) {
     return {
         ...config,
-        password: maskSecret(config.password),
         adminPassword: maskSecret(config.adminPassword),
         yourUUID: maskSecret(config.yourUUID),
         ssPsk: maskSecret(config.ssPsk),
@@ -1401,7 +1399,37 @@ function rightRotate(value, amount) {
   return (value >>> amount) | (value << (32 - amount));
 }
 
-export default {
+// ------------------------- 安全响应头 -------------------------
+const CSP_HTML = [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com",
+    "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com",
+    "font-src 'self' data: https://cdnjs.cloudflare.com",
+    "img-src 'self' data: blob: https:",
+    "connect-src 'self'",
+    "frame-ancestors 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "object-src 'none'"
+].join('; ');
+function withSecurityHeaders(resp) {
+    // WebSocket 升级响应(101)不能改，原样返回
+    if (!resp || resp.status === 101 || resp.webSocket) return resp;
+    const h = new Headers(resp.headers);
+    h.set('X-Content-Type-Options', 'nosniff');
+    h.set('Referrer-Policy', 'no-referrer');
+    h.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    h.set('X-Frame-Options', 'DENY');
+    h.set('Cross-Origin-Opener-Policy', 'same-origin');
+    h.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+    if ((h.get('Content-Type') || '').includes('text/html')) {
+        h.set('Content-Security-Policy', CSP_HTML);
+    }
+    if (!h.has('Cache-Control')) h.set('Cache-Control', 'no-store');
+    return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers: h });
+}
+
+const workerApp = {
 	/**
 	 * @param {import("@cloudflare/workers-types").Request} request
 	 * @param {{UUID: string, uuid: string, PROXYIP: string, PASSWORD: string, PASSWD: string, password: string, proxyip: string, proxyIP: string, SUB_PATH: string, subpath: string, DISABLE_TROJAN: string, CLOSE_TROJAN: string}} env
@@ -1495,7 +1523,6 @@ export default {
                         
                         const updatedConfig = {
                             yourUUID: (body.yourUUID && String(body.yourUUID).trim()) || config.yourUUID,
-                            password: (body.password && String(body.password).trim()) || config.password,
                             adminPassword: (body.adminPassword && String(body.adminPassword).trim()) || config.adminPassword,
                             subPath: body.subPath !== undefined ? String(body.subPath).trim() : config.subPath,
                             subToken: body.subToken !== undefined ? String(body.subToken).trim() : (config.subToken || ''),
@@ -1580,7 +1607,7 @@ export default {
                     if (ct.includes('application/json')) pwd = String((await request.json()).password || '');
                     else pwd = String((await request.formData()).get('password') || '');
                 } catch (e) {}
-                const secret = isAdminLogin ? config.adminPassword : config.password;
+                const secret = isAdminLogin ? config.adminPassword : (config.subToken || config.adminPassword);
                 if (pwd && safeEqual(pwd, secret)) {
                     clearLoginFail(request);
                     const cookieName = isAdminLogin ? 'cf_admin_pwd' : 'cf_user_pwd';
@@ -1758,9 +1785,17 @@ export default {
             }
             return new Response('Not Found', { status: 404 });
         } catch (err) {
-            return new Response('Internal Server Error: ' + err.message, { status: 500 });
+            // 不向外暴露内部错误细节
+            console.log('[worker error]', err && err.stack ? err.stack : err);
+            return new Response('Internal Server Error', { status: 500 });
         }
     },
+};
+
+export default {
+    async fetch(request, env, ctx) {
+        return withSecurityHeaders(await workerApp.fetch(request, env, ctx));
+    }
 };
 
 /**
@@ -1811,12 +1846,12 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
         const methodInfo = C_SS[method] || C_SS['aes-256-gcm'];
         let effectivePsk = '';
         if (methodInfo.b3) {
-            effectivePsk = await deriveSS_Psk(activeConfig.ssPsk || activeConfig.password || activeConfig.yourUUID, methodInfo.k);
+            effectivePsk = await deriveSS_Psk(activeConfig.ssPsk || activeConfig.yourUUID, methodInfo.k);
         } else {
-            effectivePsk = activeConfig.ssPsk || activeConfig.password || activeConfig.yourUUID;
+            effectivePsk = activeConfig.ssPsk || activeConfig.yourUUID;
         }
         ssInstance = new SS_Engine({
-            pw: activeConfig.ssPsk || activeConfig.password || activeConfig.yourUUID,
+            pw: activeConfig.ssPsk || activeConfig.yourUUID,
             psk: effectivePsk,
             method: method
         });
@@ -3639,7 +3674,7 @@ async function buildAllNodes(config, currentDomain, validSSPath) {
     if (!config.disabless) {
         const method = config.ssMethod || 'aes-256-gcm';
         const methodInfo = C_SS[method] || C_SS['aes-256-gcm'];
-        const rawSecret = config.ssPsk || config.password || config.yourUUID;
+        const rawSecret = config.ssPsk || config.yourUUID;
         const effectivePassword = methodInfo.b3 ? await deriveSS_Psk(rawSecret, methodInfo.k) : rawSecret;
         const encodedConfig = btoa(`${method}:${effectivePassword}`);
         for (const cdnItem of resolvedCfip) {
@@ -4012,7 +4047,7 @@ function getCookieValue(cookieHeader, name) {
 async function buildQxSsConfig(url, validSSPath, config) {
     const method = config.ssMethod || 'aes-256-gcm';
     const methodInfo = C_SS[method] || C_SS['aes-256-gcm'];
-    const rawSecret = config.ssPsk || config.password || config.yourUUID;
+    const rawSecret = config.ssPsk || config.yourUUID;
     const effectivePwd = methodInfo.b3 ? await deriveSS_Psk(rawSecret, methodInfo.k) : rawSecret;
     let qxHostPort = 'www.visa.com.tw:443';
     if (Array.isArray(config.cfip) && config.cfip.length > 0) {
@@ -4167,7 +4202,7 @@ async function getNodesPage(request, validSSPath, config, hasKV) {
 		return getCamouflageProbePage(url, false, false, `cf_user_pwd=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict${secureFlag}`);
 	}
 	const userToken = getCookieValue(request.headers.get('Cookie'), 'cf_user_pwd');
-	if (await verifyAuthToken(userToken, 'user', config.password)) {
+	if (await verifyAuthToken(userToken, 'user', config.subToken || config.adminPassword)) {
 		return await getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, null);
 	}
 	return getCamouflageProbePage(url, false, wantLoginModal);
@@ -4206,7 +4241,7 @@ async function getAdminPage(request, validSSPath, config, hasKV) {
  */
 function getLoginPage(url, baseUrl, showError = false, isAdmin = false, setCookie = null) {
     const title = isAdmin ? 'Workers Service - 后台管理登录' : 'Workers Service - 节点与订阅登录';
-    const subtitle = isAdmin ? '请输入后台管理密码 (ADMIN) 以访问管理控制台' : '请输入访问密码 (PASSWORD) 查看节点与订阅';
+    const subtitle = isAdmin ? '请输入后台管理密码 (ADMIN) 以访问管理控制台' : '请输入访问令牌 (TOKEN) 查看节点与订阅';
 
 	const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -4366,7 +4401,7 @@ function getLoginPage(url, baseUrl, showError = false, isAdmin = false, setCooki
                     id="password" 
                     name="password" 
                     class="form-input" 
-                    placeholder="${isAdmin ? '请输入后台管理密码 (ADMIN)' : '请输入访问密码 (PASSWORD)'}"
+                    placeholder="${isAdmin ? '请输入后台管理密码 (ADMIN)' : '请输入访问令牌 (TOKEN)'}"
                     required
                     autofocus
                 >
@@ -4408,7 +4443,7 @@ function getLoginPage(url, baseUrl, showError = false, isAdmin = false, setCooki
 }
 
 /**
- * 获取前台节点与订阅页面 (访问 / 且输入 PASSWORD 成功后展示)
+ * 获取前台节点与订阅页面 (访问 / 且输入 TOKEN 成功后展示)
  * @param {string} url 
  * @param {string} baseUrl 
  * @param {string} validSSPath
@@ -5588,9 +5623,9 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
                         <span class="form-hint">进入此 /admin 后台管理面板的密码</span>
                     </div>
                     <div class="form-group">
-                        <label for="cfg-password">前台访问密码 (PASSWORD)</label>
-                        <input type="text" id="cfg-password" class="form-input" value="${escHtml(config.password)}" placeholder="前台页面密码">
-                        <span class="form-hint">用户访问首页 / 查看节点订阅所用的密码</span>
+                        <label for="cfg-subtoken">访问令牌 (TOKEN)</label>
+                        <input type="text" id="cfg-subtoken" class="form-input" value="${escHtml(config.subToken || '')}" placeholder="留空则订阅不校验，前台使用 ADMIN 登录">
+                        <span class="form-hint">订阅需带 ?token=，同时作为首页查看节点的登录凭据</span>
                     </div>
                     <div class="form-group">
                         <label for="cfg-uuid">用户 UUID</label>
@@ -5599,13 +5634,13 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
                     </div>
                     <div class="form-group">
                         <label for="cfg-subpath">节点订阅路径 (SUB_PATH)</label>
-                        <input type="text" id="cfg-subpath" class="form-input" value="${escHtml(config.subPath)}" placeholder="如 link 或自定义字符串">
+                        <input type="text" id="cfg-subpath" class="form-input" value="${escHtml(config.subPath)}" placeholder="默认 sub">
                         <span class="form-hint">客户端订阅获取路径 /${escHtml(config.subPath)}</span>
                     </div>
                     <div class="form-group">
                         <label for="cfg-sspath">Shadowsocks 验证路径 (SSPATH)</label>
-                        <input type="text" id="cfg-sspath" class="form-input" value="${escHtml(config.SSpath)}" placeholder="留空则默认使用 UUID">
-                        <span class="form-hint">SS 节点 WebSocket 路径鉴权，留空使用 UUID</span>
+                        <input type="text" id="cfg-sspath" class="form-input" value="${escHtml(config.SSpath)}" placeholder="默认 fengyue">
+                        <span class="form-hint">SS 节点 WebSocket 路径鉴权，默认 fengyue</span>
                     </div>
                     <div class="form-group">
                         <label for="cfg-ssmethod">Shadowsocks 加密算法 (SS_METHOD)</label>
@@ -5631,8 +5666,8 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
                     </div>
                     <div class="form-group">
                         <label for="cfg-sspsk">Shadowsocks 2022 预共享密钥 (SS_PSK)</label>
-                        <input type="text" id="cfg-sspsk" class="form-input" value="${escHtml(config.ssPsk || '')}" placeholder="Base64 编码 PSK，留空则由密码/UUID自动派生">
-                        <span class="form-hint">Shadowsocks 2022 模式下的预共享密钥，留空自动生成</span>
+                        <input type="text" id="cfg-sspsk" class="form-input" value="${escHtml(config.ssPsk || '')}" placeholder="留空则由 UUID 自动派生">
+                        <span class="form-hint">留空时由 UUID 自动派生（同一 UUID 结果固定）</span>
                     </div>
                 </div>
             </div>
@@ -5840,11 +5875,10 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
             const proxyRaw = document.getElementById('cfg-proxyip').value;
             const proxyList = proxyRaw.split('\\n').map(s => s.trim()).filter(Boolean);
             const newAdminPwd = document.getElementById('cfg-admin-password').value.trim();
-            const newUserPwd = document.getElementById('cfg-password').value.trim();
             
             const payload = {
                 adminPassword: newAdminPwd,
-                password: newUserPwd,
+                subToken: document.getElementById('cfg-subtoken').value.trim(),
                 yourUUID: document.getElementById('cfg-uuid').value.trim(),
                 subPath: document.getElementById('cfg-subpath').value.trim(),
                 SSpath: document.getElementById('cfg-sspath').value.trim(),
