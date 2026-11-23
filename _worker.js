@@ -1871,7 +1871,7 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
                 const [bundle] = upQueue.bundle();
                 if (!bundle) break;
                 if (remoteConnWrapper.replay) {
-                    remoteConnWrapper.replay.push(bundle.slice());
+                    remoteConnWrapper.replay.push(new Uint8Array(bundle).slice());
                     remoteConnWrapper.replayBytes = (remoteConnWrapper.replayBytes || 0) + bundle.byteLength;
                     if (remoteConnWrapper.replayBytes > 65536) remoteConnWrapper.replay = null; // 过大则放弃补发
                 }
@@ -1897,7 +1897,8 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
         async write(chunk) {
             if (isTrojanUdp) return await forwardTrojanUdpDns(chunk, serverSock);
             if (isDnsQuery) return await forwardataudp(chunk, serverSock, null, ssInstance);
-            if (remoteConnWrapper.socket) {
+            // 已建立连接，或正在切换反代（数据先入队，切换完成后发出）
+            if (remoteConnWrapper.socket || remoteConnWrapper.switching) {
                 if (ssInstance) {
                     const { c: decryptedChunks, e: decryptError } = await ssInstance.decData(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk));
                     if (decryptError) {
@@ -5849,7 +5850,11 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
                 document.getElementById('tab-btn-admin').classList.add('active');
                 document.getElementById('tab-admin').classList.add('active');
             }
+            // 记住当前标签，刷新后保持
+            const h = tabName === 'nodes' ? '#nodes' : '';
+            if (location.hash !== h) history.replaceState(null, '', location.pathname + location.search + h);
         }
+        if (location.hash === '#nodes') switchTab('nodes');
 
         function showToast(message) {
             const existingToast = document.querySelector('.toast');
