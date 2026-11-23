@@ -80,6 +80,7 @@ async function loadConfig(env) {
         if (env.PASSWORD || env.PASSWD || env.password) config.password = env.PASSWORD || env.PASSWD || env.password;
         if (env.ADMIN || env.admin) config.adminPassword = env.ADMIN || env.admin;
         if (env.SUB_PATH || env.subpath) config.subPath = env.SUB_PATH || env.subpath;
+        if (env.SUB_TOKEN || env.sub_token || env.TOKEN || env.token) config.subToken = String(env.SUB_TOKEN || env.sub_token || env.TOKEN || env.token).trim();
         if (env.PROXYIP || env.proxyip || env.proxyIP) {
             const rawProxy = env.PROXYIP || env.proxyip || env.proxyIP;
             const servers = String(rawProxy).split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean);
@@ -126,6 +127,7 @@ async function loadConfig(env) {
             const kvData = await kv.get('CONFIG', 'json');
             if (kvData && typeof kvData === 'object') {
                 if (kvData.yourUUID) config.yourUUID = String(kvData.yourUUID).trim();
+                if (kvData.subToken) config.subToken = String(kvData.subToken).trim();
                 if (kvData.password) config.password = String(kvData.password).trim();
                 if (kvData.adminPassword) config.adminPassword = String(kvData.adminPassword).trim();
                 else if (kvData.ADMIN) config.adminPassword = String(kvData.ADMIN).trim();
@@ -255,6 +257,10 @@ async function isAdminAuthed(request, config) {
     if (hdr !== null) return safeEqual(hdr, config.adminPassword);
     return verifyAuthToken(getCookieValue(request.headers.get('Cookie'), 'cf_admin_pwd'), 'admin', config.adminPassword);
 }
+function subPathWithToken(config) {
+    const path = String(config.subPath || '').replace(/^\/+/, '');
+    return config.subToken ? `${path}?token=${encodeURIComponent(config.subToken)}` : path;
+}
 function maskSecret(v) { v = String(v || ''); return v ? (v.length <= 4 ? '****' : v.slice(0, 2) + '****' + v.slice(-2)) : ''; }
 function maskProxyCred(addr) { return String(addr).replace(/(\/\/)([^@\/]+)@/, (m, a) => `${a}****@`); }
 function sanitizeConfig(config) {
@@ -264,6 +270,7 @@ function sanitizeConfig(config) {
         adminPassword: maskSecret(config.adminPassword),
         yourUUID: maskSecret(config.yourUUID),
         ssPsk: maskSecret(config.ssPsk),
+        subToken: maskSecret(config.subToken),
         landingProxy: maskProxyCred(config.landingProxy || ''),
         landingProxies: (config.landingProxies || []).map(maskProxyCred),
         proxyIPs: (config.proxyIPs || []).map(maskProxyCred)
@@ -1301,6 +1308,11 @@ function parsePryAddress(serverStr) {
         }
     }
 
+    // 不带中括号的纯 IPv6（如 2001:db8::1），整体视为主机，端口默认 443
+    if ((serverStr.match(/:/g) || []).length >= 2) {
+        return { type: 'direct', host: serverStr, port: 443 };
+    }
+
     const lastColonIndex = serverStr.lastIndexOf(':');
     
     if (lastColonIndex > 0) {
@@ -1486,6 +1498,7 @@ export default {
                             password: (body.password && String(body.password).trim()) || config.password,
                             adminPassword: (body.adminPassword && String(body.adminPassword).trim()) || config.adminPassword,
                             subPath: body.subPath !== undefined ? String(body.subPath).trim() : config.subPath,
+                            subToken: body.subToken !== undefined ? String(body.subToken).trim() : (config.subToken || ''),
                             proxyIP: mainProxyIP,
                             proxyIPs: finalProxyIPs,
                             landingProxy: mainLandingProxy,
@@ -1638,6 +1651,9 @@ export default {
                         let raw = targetList[idx].trim();
                         if (raw.includes('#')) raw = raw.split('#')[0].trim();
                         customProxyIP = raw.replace(/^(?:ld|fd|proxyip)=/i, '').trim();
+                    } else {
+                        // 序号越界：忽略，回退到全局配置
+                        customProxyIP = '';
                     }
                 }
 
@@ -1677,6 +1693,10 @@ export default {
                 const cleanReqPath = url.pathname.replace(/\/+$/, '').toLowerCase();
                 const cleanSubPath = `/${config.subPath.replace(/^\/+|\/+$/g, '').toLowerCase()}`;
                 if (cleanReqPath === cleanSubPath) {
+                    // 订阅 token 校验：设置了 SUB_TOKEN 时必须带 ?token=，否则伪装 404
+                    if (config.subToken && !safeEqual(url.searchParams.get('token') || '', config.subToken)) {
+                        return new Response('Not Found', { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+                    }
                     const currentDomain = url.hostname;
                     const allNodes = await buildAllNodes(config, currentDomain, validSSPath);
                     const filterType = (url.searchParams.get('type') || '').toLowerCase();
@@ -1805,6 +1825,7 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
 
     const upQueue = mkQ(GRAIN_CFG.upPack);
     let headPending = null;
+    remoteConnWrapper.flush = () => flushUpstream();
     let isWriting = false;
 
     async function flushUpstream() {
@@ -1814,6 +1835,11 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
             while (!upQueue.empty && remoteConnWrapper.socket) {
                 const [bundle] = upQueue.bundle();
                 if (!bundle) break;
+                if (remoteConnWrapper.replay) {
+                    remoteConnWrapper.replay.push(bundle.slice());
+                    remoteConnWrapper.replayBytes = (remoteConnWrapper.replayBytes || 0) + bundle.byteLength;
+                    if (remoteConnWrapper.replayBytes > 65536) remoteConnWrapper.replay = null; // 过大则放弃补发
+                }
                 const writer = remoteConnWrapper.socket.writable.getWriter();
                 try {
                     await writer.write(bundle);
@@ -1822,7 +1848,8 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
                 }
             }
         } catch (e) {
-            closeSocketQuietly(serverSock);
+            // 直连阶段写失败且还能切反代时，不断开客户端，交给重试逻辑
+            if (!remoteConnWrapper.switching) closeSocketQuietly(serverSock);
         } finally {
             isWriting = false;
             if (!upQueue.empty && remoteConnWrapper.socket) {
@@ -2364,6 +2391,52 @@ async function resolveDnsA(host) {
     } finally {
         clearTimeout(timer);
     }
+}
+
+// 解析域名全部 A 记录（反代多 IP 轮询用），带 5 分钟缓存
+const dnsAllCache = new Map();
+async function resolveDnsAll(host) {
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || String(host).includes(':')) return [host];
+    const key = String(host).toLowerCase();
+    const now = Date.now();
+    const cached = dnsAllCache.get(key);
+    if (cached && now < cached.exp) return cached.ips;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    try {
+        const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(key)}&type=A`, {
+            headers: { Accept: 'application/dns-json' },
+            signal: controller.signal
+        });
+        const json = await res.json();
+        const ips = (json.Answer || []).filter(a => a.type === 1 && a.data).map(a => a.data);
+        if (ips.length) {
+            if (dnsAllCache.size >= 200) dnsAllCache.delete(dnsAllCache.keys().next().value);
+            dnsAllCache.set(key, { ips, exp: now + DNS_CACHE_TTL_MS });
+            return ips;
+        }
+    } catch (e) {
+    } finally {
+        clearTimeout(timer);
+    }
+    return [host]; // 解析失败交给 connect 自行解析
+}
+
+// 直连失败缓存：目标在 5 分钟内直接走反代（如 Cloudflare 站点）
+const directFailCache = new Map();
+const DIRECT_FAIL_TTL_MS = 5 * 60 * 1000;
+function markDirectFail(host) {
+    const k = String(host).toLowerCase();
+    if (directFailCache.size >= 2000) directFailCache.delete(directFailCache.keys().next().value);
+    directFailCache.set(k, Date.now() + DIRECT_FAIL_TTL_MS);
+}
+function isDirectFailCached(host) {
+    const k = String(host).toLowerCase();
+    const exp = directFailCache.get(k);
+    if (!exp) return false;
+    if (exp > Date.now()) return true;
+    directFailCache.delete(k);
+    return false;
 }
 
 // ------------------------- SoftEther (MS-SSTP) 落地代理 -------------------------
@@ -2960,104 +3033,147 @@ async function connect2Turn(proxyConfig, targetHost, targetPort, initialData) {
 }
 
 async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, customProxyIP, request, ssInstance) {
-    async function connectDirect(address, port, data, concur = GRAIN_CFG.concur) {
-        const connector = getSocketConnector(request);
-        const sock = await raceSprout(connector, address, port, concur);
+    const connector = getSocketConnector(request);
+    async function writeInitial(sock, data) {
         if (data && data.byteLength > 0) {
             const writer = sock.writable.getWriter();
-            try {
-                await writer.write(data);
-            } finally {
-                writer.releaseLock();
-            }
+            try { await writer.write(data); } finally { writer.releaseLock(); }
         }
         return sock;
     }
-    
+    async function connectDirect(address, port, data, concur = GRAIN_CFG.concur) {
+        return writeInitial(await raceSprout(connector, address, port, concur), data);
+    }
+    // 反代：解析全部 IP，打乱后依次尝试（每个 3 秒超时，最多 3 个）
+    async function connectProxyIP(address, port, data) {
+        let ips = await resolveDnsAll(address);
+        ips = [...ips].sort(() => Math.random() - 0.5).slice(0, 3);
+        let lastErr = null;
+        for (const ip of ips) {
+            let sock = null;
+            try {
+                sock = connector.connect({ hostname: ip, port });
+                await withTimeout(sock.opened, 3000, `ProxyIP ${ip}:${port} timeout`);
+                return await writeInitial(sock, data);
+            } catch (e) {
+                lastErr = e;
+                closeSocketQuietly(sock);
+            }
+        }
+        throw lastErr || new Error('ProxyIP connect failed');
+    }
+
+    // 序号形式的参数（入口已转换，这里只兜底；越界则回退全局配置）
+    if (customProxyIP && /^\d+$/.test(customProxyIP.trim())) {
+        const idx = parseInt(customProxyIP.trim(), 10);
+        const list = (Array.isArray(proxyIPs) && proxyIPs.length > 0) ? proxyIPs : (proxyIP ? [proxyIP] : []);
+        customProxyIP = list[idx] ? list[idx].split('#')[0].replace(/^(?:ld|fd|proxyip)=/i, '').trim() : '';
+    }
+
+    const isProxyType = c => c && ['socks5', 'http', 'https', 'sstp', 'turn'].includes(c.type);
     let proxyConfig = null;
     let shouldUseProxy = false;
 
-    // 出站决策优先级：
-    // 1. 若请求明确携带 customProxyIP (如 /ld=... 或 /fd=...)，优先按请求参数出站
-    // 2. 否则按全局配置：全局落地代理 (landingProxies) 优先级最高，一旦配置落地代理，反代自动挂起失效
-    // 3. 若未配置全局落地代理，才回退到反代分流 (proxyIPs)
+    // 出站决策：请求参数 > 全局落地代理 > 反代
     if (customProxyIP) {
-        if (/^\d+$/.test(customProxyIP.trim())) {
-            const idx = parseInt(customProxyIP.trim(), 10);
-            const targetList = (Array.isArray(landingProxies) && landingProxies.length > 0)
-                ? landingProxies
-                : ((Array.isArray(proxyIPs) && proxyIPs.length > 0) ? proxyIPs : (proxyIP ? [proxyIP] : []));
-            if (targetList[idx]) {
-                let raw = targetList[idx].trim();
-                if (raw.includes('#')) raw = raw.split('#')[0].trim();
-                customProxyIP = raw.replace(/^(?:ld|fd|proxyip)=/i, '').trim();
-            }
-        }
         proxyConfig = parsePryAddress(customProxyIP);
-        if (proxyConfig && (proxyConfig.type === 'socks5' || proxyConfig.type === 'http' || proxyConfig.type === 'https' || proxyConfig.type === 'sstp' || proxyConfig.type === 'turn')) {
-            shouldUseProxy = true;
-        } else if (!proxyConfig && (landingProxy || proxyIP)) {
-            const fb = (landingProxy || proxyIP).split('#')[0].trim();
-            if (fb) proxyConfig = parsePryAddress(fb) || { type: 'direct', host: fb, port: 443 };
-        }
-    } else {
-        // 全局落地代理优先
+        if (isProxyType(proxyConfig)) shouldUseProxy = true;
+    }
+    if (!proxyConfig) {
         const rawLanding = (Array.isArray(landingProxies) && landingProxies.length > 0) ? landingProxies[0] : landingProxy;
         const effectiveLanding = rawLanding ? rawLanding.split('#')[0].replace(/^(?:ld|fd|proxyip)=/i, '').trim() : '';
         if (effectiveLanding) {
             proxyConfig = parsePryAddress(effectiveLanding);
-            if (proxyConfig && (proxyConfig.type === 'socks5' || proxyConfig.type === 'http' || proxyConfig.type === 'https' || proxyConfig.type === 'sstp' || proxyConfig.type === 'turn')) {
-                shouldUseProxy = true;
-            }
+            if (isProxyType(proxyConfig)) shouldUseProxy = true;
         }
-        // 未配置落地代理时，才生效反代
         const cleanProxyIP = proxyIP ? proxyIP.split('#')[0].replace(/^(?:ld|fd|proxyip)=/i, '').trim() : '';
         if (!proxyConfig && cleanProxyIP) {
             proxyConfig = parsePryAddress(cleanProxyIP) || { type: 'direct', host: cleanProxyIP, port: 443 };
-            if (proxyConfig.type === 'socks5' || proxyConfig.type === 'http' || proxyConfig.type === 'https' || proxyConfig.type === 'sstp' || proxyConfig.type === 'turn') {
-                shouldUseProxy = true;
-            }
+            if (isProxyType(proxyConfig)) shouldUseProxy = true;
         }
     }
-    
+
     const hasFallbackProxy = !!(proxyConfig && proxyConfig.host);
 
+    // 最近直连失败过的目标，直接走反代，省掉一次失败等待
+    if (!shouldUseProxy && hasFallbackProxy && isDirectFailCached(host)) shouldUseProxy = true;
+
+    let retried = false;
     async function connecttoPry() {
+        if (retried) return;
+        retried = true;
         if (!proxyConfig || !proxyConfig.host) {
             throw new Error('Direct connection failed and no fallback proxy configured');
         }
-        let newSocket;
-        if (proxyConfig.type === 'socks5') {
-            newSocket = await connect2Socks5(proxyConfig, host, portNum, rawData);
-        } else if (proxyConfig.type === 'http' || proxyConfig.type === 'https') {
-            newSocket = await connect2Http(proxyConfig, host, portNum, rawData);
-        } else if (proxyConfig.type === 'sstp') {
-            newSocket = await connect2Sstp(proxyConfig, host, portNum, rawData);
-        } else if (proxyConfig.type === 'turn') {
-            newSocket = await connect2Turn(proxyConfig, host, portNum, rawData);
-        } else {
-            newSocket = await connectDirect(proxyConfig.host, proxyConfig.port, rawData, 1);
+        // 1. 关闭旧的直连，暂停上行写入（期间客户端数据留在队列里）
+        const oldSock = remoteConnWrapper.socket;
+        remoteConnWrapper.switching = true;
+        remoteConnWrapper.socket = null;
+        closeSocketQuietly(oldSock);
+
+        // 2. 首包 + 直连阶段已发出的数据一起补发
+        const replay = remoteConnWrapper.replay || [];
+        remoteConnWrapper.replay = null;
+        let payload = rawData;
+        if (replay.length) {
+            const total = (rawData ? rawData.byteLength : 0) + replay.reduce((n, x) => n + x.byteLength, 0);
+            payload = new Uint8Array(total);
+            let o = 0;
+            if (rawData && rawData.byteLength) { payload.set(rawData instanceof Uint8Array ? rawData : new Uint8Array(rawData), 0); o = rawData.byteLength; }
+            for (const x of replay) { payload.set(x, o); o += x.byteLength; }
         }
-        
+
+        let newSocket;
+        try {
+            if (proxyConfig.type === 'socks5') {
+                newSocket = await connect2Socks5(proxyConfig, host, portNum, payload);
+            } else if (proxyConfig.type === 'http' || proxyConfig.type === 'https') {
+                newSocket = await connect2Http(proxyConfig, host, portNum, payload);
+            } else if (proxyConfig.type === 'sstp') {
+                newSocket = await connect2Sstp(proxyConfig, host, portNum, payload);
+            } else if (proxyConfig.type === 'turn') {
+                newSocket = await connect2Turn(proxyConfig, host, portNum, payload);
+            } else {
+                newSocket = await connectProxyIP(proxyConfig.host, proxyConfig.port, payload);
+            }
+        } catch (e) {
+            remoteConnWrapper.switching = false;
+            closeSocketQuietly(ws);
+            throw e;
+        }
+        remoteConnWrapper.switching = false;
+        // 客户端在切换过程中已经断开：直接释放新连接
+        if (ws.readyState !== WS_READY_STATE_OPEN) {
+            closeSocketQuietly(newSocket);
+            return;
+        }
         remoteConnWrapper.socket = newSocket;
         newSocket.closed?.catch(() => {}).finally(() => closeSocketQuietly(ws));
         connectStreams(newSocket, ws, respHeader, null, ssInstance);
+        // 3. 把切换期间排队的上行数据继续发出去
+        if (remoteConnWrapper.flush) remoteConnWrapper.flush();
     }
-    
+
     if (shouldUseProxy) {
         await connecttoPry();
-    } else {
-        try {
-            const initialSocket = await connectDirect(host, portNum, rawData, GRAIN_CFG.concur);
-            remoteConnWrapper.socket = initialSocket;
-            connectStreams(initialSocket, ws, respHeader, hasFallbackProxy ? connecttoPry : null, ssInstance);
-        } catch (err) {
-            remoteConnWrapper.socket = null;
-            if (hasFallbackProxy) {
-                await connecttoPry();
-            } else {
-                throw err;
-            }
+        return;
+    }
+    try {
+        // 直连阶段开启“已发数据记录”，以便切反代时补发
+        remoteConnWrapper.replay = hasFallbackProxy ? [] : null;
+        remoteConnWrapper.replayBytes = 0;
+        const initialSocket = await connectDirect(host, portNum, rawData, GRAIN_CFG.concur);
+        remoteConnWrapper.socket = initialSocket;
+        const retry = hasFallbackProxy ? async () => { markDirectFail(host); await connecttoPry(); } : null;
+        connectStreams(initialSocket, ws, respHeader, retry, ssInstance, () => { remoteConnWrapper.replay = null; });
+    } catch (err) {
+        remoteConnWrapper.socket = null;
+        if (hasFallbackProxy) {
+            markDirectFail(host);
+            await connecttoPry();
+        } else {
+            remoteConnWrapper.replay = null;
+            throw err;
         }
     }
 }
@@ -3181,10 +3297,11 @@ function makeReadableStr(socket, earlyDataHeader) {
     });
 }
 
-async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, ssInstance) {
+async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, ssInstance, onFirstData) {
     let header = headerData, hasData = false;
 
     async function sendChunk(data) {
+        if (!hasData && onFirstData) { try { onFirstData(); } catch (e) {} }
         hasData = true;
         if (webSocket.readyState !== WS_READY_STATE_OPEN) {
             throw new Error('ws.readyState is not open');
@@ -3208,8 +3325,8 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, ss
     const tx = mkDn(webSocket, sendChunk);
     const rd = remoteSocket?.readable;
     if (!rd) {
-        closeSocketQuietly(webSocket);
-        if (!hasData && retryFunc) await retryFunc();
+        if (retryFunc && webSocket.readyState === WS_READY_STATE_OPEN) await retryFunc();
+        else closeSocketQuietly(webSocket);
         return;
     }
 
@@ -3252,13 +3369,14 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, ss
         }
         await tx.reap();
     } catch (err) {
-        closeSocketQuietly(webSocket);
+        if (hasData || !retryFunc) closeSocketQuietly(webSocket);
     } finally {
         try { await tx.reap(); } catch (e) {}
         try { r?.releaseLock(); } catch (e) {}
     }
 
-    if (!hasData && retryFunc) {
+    // 仅在：没收到任何数据 + 客户端仍在线 时才切换反代重试
+    if (!hasData && retryFunc && webSocket.readyState === WS_READY_STATE_OPEN) {
         await retryFunc();
     }
 }
@@ -4301,7 +4419,7 @@ function getLoginPage(url, baseUrl, showError = false, isAdmin = false, setCooki
 function formatSubconverterUrl(prefix, target, rawUrl) {
     const cleanPrefix = (prefix || '').trim();
     if (!cleanPrefix) {
-        return `${rawUrl}?target=${target}`;
+        return `${rawUrl}${rawUrl.includes('?') ? '&' : '?'}target=${target}`;
     }
     const encodedRaw = encodeURIComponent(rawUrl);
     if (cleanPrefix.includes('url=')) {
@@ -4414,7 +4532,7 @@ function renderNodeListAndQrWidget(nodes, clashFullUrl, singboxFullUrl, rawSubUr
 }
 
 async function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, setCookie = null) {
-    const rawSubUrl = `${baseUrl}/${config.subPath}`;
+    const rawSubUrl = `${baseUrl}/${subPathWithToken(config)}`;
     const clashFullUrl = formatSubconverterUrl(config.clashSubUrl, 'clash', rawSubUrl);
     const singboxFullUrl = formatSubconverterUrl(config.singboxSubUrl, 'singbox', rawSubUrl);
     const qxFullConfig = await buildQxSsConfig(url, validSSPath, config);
@@ -4754,7 +4872,7 @@ async function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, set
             </div>
             <div class="info-item">
                 <span class="label">全协议订阅地址</span>
-                <span class="value">${baseUrl}/${config.subPath}</span>
+                <span class="value">${baseUrl}/${subPathWithToken(config)}</span>
             </div>
             <div class="info-item">
                 <span class="label">Clash 订阅地址</span>
@@ -4824,7 +4942,7 @@ async function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, set
         }
 
         function copySubscription() {
-            const configUrl = ${escJsStr(`${baseUrl}/${config.subPath}`)};
+            const configUrl = ${escJsStr(`${baseUrl}/${subPathWithToken(config)}`)};
             copyText(configUrl, '全协议订阅链接已复制到剪贴板!');
         }
         
@@ -4890,7 +5008,7 @@ async function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, set
  * @returns {Response}
  */
 async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, setCookie = null) {
-    const rawSubUrl = `${baseUrl}/${config.subPath}`;
+    const rawSubUrl = `${baseUrl}/${subPathWithToken(config)}`;
     const clashFullUrl = formatSubconverterUrl(config.clashSubUrl, 'clash', rawSubUrl);
     const singboxFullUrl = formatSubconverterUrl(config.singboxSubUrl, 'singbox', rawSubUrl);
     const qxFullConfig = await buildQxSsConfig(url, validSSPath, config);
@@ -5632,7 +5750,7 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
                 </div>
                 <div class="info-item">
                     <span class="label">全协议订阅地址</span>
-                    <span class="value">${baseUrl}/${config.subPath}</span>
+                    <span class="value">${baseUrl}/${subPathWithToken(config)}</span>
                 </div>
                 <div class="info-item">
                     <span class="label">Clash 订阅地址</span>
@@ -5783,7 +5901,7 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
         }
         
         function copySubscription() {
-            const configUrl = ${escJsStr(`${baseUrl}/${config.subPath}`)};
+            const configUrl = ${escJsStr(`${baseUrl}/${subPathWithToken(config)}`)};
             copyText(configUrl, '全协议订阅链接已复制到剪贴板!');
         }
         
