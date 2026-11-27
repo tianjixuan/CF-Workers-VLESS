@@ -1236,13 +1236,18 @@ function parsePryAddress(serverStr) {
     }
 
     // 解析 TURN (RFC 5766 / RFC 6062)
-    if (serverStr.startsWith('turn://')) {
+    if (serverStr.startsWith('turn://') || serverStr.startsWith('turns://')) {
         try {
             const url = new URL(serverStr);
+            const isTls = serverStr.startsWith('turns://');
             return {
                 type: 'turn',
-                host: url.hostname,
-                port: parseInt(url.port) || 3478,
+                tls: isTls,
+                // turns://host:5349?insecure  跳过证书校验；?sni=域名 指定校验域名
+                insecure: isTls && /^(?:1|true|yes|)$/i.test(url.searchParams.get('insecure') ?? url.searchParams.get('allowInsecure') ?? 'no'),
+                sni: url.searchParams.get('sni') || '',
+                host: url.hostname.replace(/^\[|\]$/g, ''),
+                port: parseInt(url.port) || (isTls ? 5349 : 3478),
                 username: url.username ? decodeURIComponent(url.username) : '',
                 password: url.password ? decodeURIComponent(url.password) : ''
             };
@@ -1623,8 +1628,8 @@ const workerApp = {
             if (request.headers.get('Upgrade') === 'websocket') {
                 // 路径中 proxyip / fd (分流代理) / ld (落地代理) 提取 (支持 sstp://, turn://, socks5://, http(s)://)
                 let pathProxyIP = null;
-                const proxyIpMatch = pathname.match(/\/(?:proxyip|fd|ld)=((?:sstp|turn|socks5|socks|https|http):\/\/[^\s?&#]+)/i) ||
-                                     pathname.match(/^\/((?:sstp|turn):\/\/[^\s?&#]+)/i) ||
+                const proxyIpMatch = pathname.match(/\/(?:proxyip|fd|ld)=((?:sstp|turns?|socks5|socks|https|http):\/\/[^\s?&#]+)/i) ||
+                                     pathname.match(/^\/((?:sstp|turns?):\/\/[^\s?&#]+)/i) ||
                                      pathname.match(/\/(?:proxyip|fd|ld)=([^/?&#]+)/i);
                 if (proxyIpMatch) {
                     try {
@@ -1650,11 +1655,11 @@ const workerApp = {
                     } catch (e) {
                         rawUrl = request.url || '';
                     }
-                    const ldMatch = rawUrl.match(/[?&;/]ld=((?:sstp|turn|socks5|socks|https|http):\/\/[^\s?&#]+(?:\?(?:sni|insecure|allowInsecure)(?:=[^\s&#/]*)?(?:&(?:sni|insecure|allowInsecure)(?:=[^\s&#/]*)?)*)?)/i) ||
+                    const ldMatch = rawUrl.match(/[?&;/]ld=((?:sstp|turns?|socks5|socks|https|http):\/\/[^\s?&#]+(?:\?(?:sni|insecure|allowInsecure)(?:=[^\s&#/]*)?(?:&(?:sni|insecure|allowInsecure)(?:=[^\s&#/]*)?)*)?)/i) ||
                                     rawUrl.match(/[?&;/]ld=([^/?&#\s]+)/i);
                     if (ldMatch) reqLd = ldMatch[1].trim();
 
-                    const fdMatch = rawUrl.match(/[?&;/](?:fd|proxyip)=((?:sstp|turn|socks5|socks|https|http):\/\/[^\s?&#]+)/i) ||
+                    const fdMatch = rawUrl.match(/[?&;/](?:fd|proxyip)=((?:sstp|turns?|socks5|socks|https|http):\/\/[^\s?&#]+)/i) ||
                                     rawUrl.match(/[?&;/](?:fd|proxyip)=([^/?&#\s]+)/i);
                     if (fdMatch) reqFd = fdMatch[1].trim();
                 }
@@ -2868,8 +2873,8 @@ async function connect2Sstp(proxyConfig, targetHost, targetPort, initialData) {
 
 // ------------------------- TURN (RFC 5766 / RFC 6062) 落地代理 -------------------------
 const TURN_MAGIC = new Uint8Array([0x21, 0x12, 0xA4, 0x42]);
-const TURN_MT = { AQ: 0x003, AO: 0x103, AE: 0x113, PQ: 0x008, PO: 0x108, CQ: 0x00A, CO: 0x10A, BQ: 0x00B, BO: 0x10B };
-const TURN_AT = { USER: 0x006, MI: 0x008, ERR: 0x009, PEER: 0x012, REALM: 0x014, NONCE: 0x015, TRANSPORT: 0x019, CONNID: 0x02A };
+const TURN_MT = { AQ: 0x003, AO: 0x103, AE: 0x113, PQ: 0x008, PO: 0x108, CQ: 0x00A, CO: 0x10A, BQ: 0x00B, BO: 0x10B, RQ: 0x004, RO: 0x104 };
+const TURN_AT = { USER: 0x006, MI: 0x008, ERR: 0x009, PEER: 0x012, REALM: 0x014, NONCE: 0x015, TRANSPORT: 0x019, CONNID: 0x02A, LIFETIME: 0x00D };
 
 const turnCat = (...a) => {
     const r = new Uint8Array(a.reduce((s, x) => s + x.length, 0));
@@ -2947,6 +2952,63 @@ const turnReadStun = async (rd, buf) => {
     }
 };
 
+// TURN 建连：明文 / 原生 TLS / Mini TLS(insecure 或纯 IP)，统一返回 socket 形状
+const TURN_REFRESH_MS = 4 * 60 * 1000; // 授权 5 分钟、分配 10 分钟，每 4 分钟续期一次
+async function turnOpenSocket(cfg) {
+    const { host, port, tls, insecure, sni } = cfg;
+    if (!tls) {
+        const s = connect({ hostname: host, port });
+        await withTimeout(s.opened, 8000, `TURN connect ${host}:${port} timeout`);
+        return s;
+    }
+    const useMini = insecure || (isIpLiteral(host) && !sni);
+    if (!useMini) {
+        let s;
+        if (sni && sni !== host) {
+            const plain = connect({ hostname: host, port }, { secureTransport: 'starttls' });
+            await withTimeout(plain.opened, 8000, `TURN connect ${host}:${port} timeout`);
+            s = plain.startTls({ expectedServerHostname: sni });
+        } else {
+            s = connect({ hostname: host, port }, { secureTransport: 'on' });
+        }
+        await withTimeout(s.opened, 8000, `TURN TLS ${host}:${port} timeout`);
+        return s;
+    }
+    const raw = connect({ hostname: host, port });
+    await withTimeout(raw.opened, 8000, `TURN connect ${host}:${port} timeout`);
+    const t = new MiniTlsClient(raw, { serverName: sni || (isIpLiteral(host) ? '' : host), timeout: 0 });
+    try {
+        await withTimeout(t.handshake(), 10000, `TURN Mini TLS handshake ${host}:${port} timeout`);
+    } catch (e) { try { raw.close(); } catch (_) {} throw e; }
+    let closed = false;
+    const close = () => { if (closed) return; closed = true; try { t.close(); } catch (_) {} };
+    return {
+        opened: Promise.resolve(),
+        closed: raw.closed,
+        close,
+        readable: new ReadableStream({
+            async pull(c) {
+                try {
+                    for (;;) {
+                        const d = await t.read();
+                        if (!d) { c.close(); close(); return; }
+                        if (d.byteLength) { c.enqueue(d); return; }
+                    }
+                } catch (e) { c.error(e); close(); }
+            },
+            cancel() { close(); }
+        }),
+        writable: new WritableStream({
+            async write(chunk) {
+                const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+                for (let o = 0; o < u8.byteLength; o += 16000) await t.write(u8.subarray(o, o + 16000));
+            },
+            close() { close(); },
+            abort() { close(); }
+        })
+    };
+}
+
 const turnMd5 = async s => new Uint8Array(await crypto.subtle.digest('MD5', new TextEncoder().encode(s)));
 
 async function connect2Turn(proxyConfig, targetHost, targetPort, initialData) {
@@ -2955,21 +3017,24 @@ async function connect2Turn(proxyConfig, targetHost, targetPort, initialData) {
     if (!targetIp) throw new Error(`TURN DNS resolution failed for: ${targetHost}`);
 
     let ctrl = null, data = null;
+    let refreshTimer = 0;
     let isClosed = false;
+    const sockCfg = { host, port: port || (proxyConfig.tls ? 5349 : 3478), tls: !!proxyConfig.tls, insecure: !!proxyConfig.insecure, sni: proxyConfig.sni || '' };
     let closedResolve;
     const closedPromise = new Promise(resolve => { closedResolve = resolve; });
 
     const closeAll = () => {
         if (isClosed) return;
         isClosed = true;
+        if (refreshTimer) clearInterval(refreshTimer);
         try { ctrl?.close(); } catch {}
-        try { data?.close(); } catch {}
+        if (data && typeof data.then === 'function') data.then(d => { try { d.close(); } catch {} }, () => {});
+        else { try { data?.close(); } catch {} }
         closedResolve();
     };
 
     try {
-        ctrl = connect({ hostname: host, port: port || 3478 });
-        await ctrl.opened;
+        ctrl = await turnOpenSocket(sockCfg);
         const cw = ctrl.writable.getWriter();
         const cr = ctrl.readable.getReader();
         const tid = () => crypto.getRandomValues(new Uint8Array(12));
@@ -2999,7 +3064,7 @@ async function connect2Turn(proxyConfig, targetHost, targetPort, initialData) {
                 sign(turnStunMsg(TURN_MT.CQ, tid(), [peer, ...aa]))
             ]);
             await cw.write(turnCat(am, pm, cm));
-            data = connect({ hostname: host, port: port || 3478 });
+            data = turnOpenSocket(sockCfg);
             [r, ex] = await turnReadStun(cr, ex);
             if (r?.type !== TURN_MT.AO) throw new Error('TURN Allocate authentication failed');
         } else if (r.type === TURN_MT.AO) {
@@ -3008,7 +3073,7 @@ async function connect2Turn(proxyConfig, targetHost, targetPort, initialData) {
                 sign(turnStunMsg(TURN_MT.CQ, tid(), [peer, ...aa]))
             ]);
             await cw.write(turnCat(pm, cm));
-            data = connect({ hostname: host, port: port || 3478 });
+            data = turnOpenSocket(sockCfg);
         } else {
             throw new Error('TURN unexpected response type: ' + r.type);
         }
@@ -3018,7 +3083,7 @@ async function connect2Turn(proxyConfig, targetHost, targetPort, initialData) {
         [r, ex] = await turnReadStun(cr, ex);
         if (r?.type !== TURN_MT.CO || !r.attrs[TURN_AT.CONNID]) throw new Error('TURN Connect failed');
 
-        await data.opened;
+        data = await data;
         const dw = data.writable.getWriter();
         const dr = data.readable.getReader();
         await dw.write(await sign(turnStunMsg(TURN_MT.BQ, tid(), [turnStunAttr(TURN_AT.CONNID, r.attrs[TURN_AT.CONNID]), ...aa])));
@@ -3026,9 +3091,40 @@ async function connect2Turn(proxyConfig, targetHost, targetPort, initialData) {
         [r, extra] = await turnReadStun(dr);
         if (r?.type !== TURN_MT.BO) throw new Error('TURN ConnectionBind failed');
 
-        cr.releaseLock();
-        cw.releaseLock();
         dw.releaseLock();
+
+        // 控制连接保活：持续读取服务器消息，定时续期分配与授权；nonce 过期(438)时更新后重发
+        const realmStr = new TextDecoder().decode(aa.length ? (aa[1].subarray(4, 4 + ((aa[1][2] << 8) | aa[1][3]))) : new Uint8Array(0));
+        const sendRefresh = async () => {
+            if (isClosed) return;
+            try {
+                const lifetime = new Uint8Array(4); new DataView(lifetime.buffer).setUint32(0, 600);
+                const rm = await sign(turnStunMsg(TURN_MT.RQ, tid(), [turnStunAttr(TURN_AT.LIFETIME, lifetime), ...aa]));
+                const pm = await sign(turnStunMsg(TURN_MT.PQ, tid(), [peer, ...aa]));
+                await cw.write(turnCat(rm, pm));
+            } catch (e) { closeAll(); }
+        };
+        refreshTimer = setInterval(sendRefresh, TURN_REFRESH_MS);
+        (async () => {
+            let buf = ex;
+            while (!isClosed) {
+                const [m, rest] = await turnReadStun(cr, buf);
+                buf = rest;
+                if (!m) { closeAll(); return; }
+                const isErr = (m.type & 0x0110) === 0x0110;
+                if (isErr && turnParseErr(m.attrs[TURN_AT.ERR]) === 438 && m.attrs[TURN_AT.NONCE] && key) {
+                    aa = [
+                        turnStunAttr(TURN_AT.USER, new TextEncoder().encode(user)),
+                        turnStunAttr(TURN_AT.REALM, new TextEncoder().encode(realmStr)),
+                        turnStunAttr(TURN_AT.NONCE, m.attrs[TURN_AT.NONCE])
+                    ];
+                    await sendRefresh();
+                } else if (isErr) {
+                    console.log('[turn] refresh error', turnParseErr(m.attrs[TURN_AT.ERR]));
+                    closeAll(); return;
+                }
+            }
+        })().catch(() => closeAll());
 
         const readable = new ReadableStream({
             start(c) {
@@ -3042,7 +3138,7 @@ async function connect2Turn(proxyConfig, targetHost, targetPort, initialData) {
                     } else {
                         c.enqueue(new Uint8Array(value));
                     }
-                });
+                }, err => { c.error(err); closeAll(); });
             },
             cancel() {
                 dr.cancel().catch(() => {});
