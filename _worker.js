@@ -5360,11 +5360,11 @@ async function getNodesPageContent(url, baseUrl, validSSPath, config, hasKV, set
                     </svg>
                     <span>GitHub 项目</span>
                 </a>
-                <a href="https://proxy.fengyue.bond" target="_blank" class="footer-link">
+                <a href="https://proxy.194216.xyz" target="_blank" class="footer-link">
                     <span>✅</span>
                     <span>Proxyip 检测服务</span>
                 </a>
-                <a href="https://socks.fengyue.bond" target="_blank" class="footer-link">
+                <a href="https://socks.194216.xyz" target="_blank" class="footer-link">
                     <span>🧦</span>
                     <span>socks5 检测服务</span>
                 </a>
@@ -6237,11 +6237,11 @@ async function getAdminPageContent(url, baseUrl, validSSPath, config, hasKV, set
                     <i class="fab fa-github"></i>
                     <span>GitHub 项目</span>
                 </a>
-                <a href="https://proxy.fengyue.bond" target="_blank" class="footer-link">
+                <a href="https://proxy.194216.xyz" target="_blank" class="footer-link">
                     <span>✅</span>
                     <span>Proxyip 检测服务</span>
                 </a>
-                <a href="https://socks.fengyue.bond" target="_blank" class="footer-link">
+                <a href="https://socks.194216.xyz" target="_blank" class="footer-link">
                     <span>🧦</span>
                     <span>socks5 检测服务</span>
                 </a>
