@@ -3102,7 +3102,7 @@ async function connect2Turn(proxyConfig, targetHost, targetPort, initialData) {
                 const rm = await sign(turnStunMsg(TURN_MT.RQ, tid(), [turnStunAttr(TURN_AT.LIFETIME, lifetime), ...aa]));
                 const pm = await sign(turnStunMsg(TURN_MT.PQ, tid(), [peer, ...aa]));
                 await cw.write(turnCat(rm, pm));
-            } catch (e) { closeAll(); }
+            } catch (e) { if (refreshTimer) clearInterval(refreshTimer); refreshTimer = 0; }
         };
         refreshTimer = setInterval(sendRefresh, TURN_REFRESH_MS);
         (async () => {
@@ -3110,7 +3110,8 @@ async function connect2Turn(proxyConfig, targetHost, targetPort, initialData) {
             while (!isClosed) {
                 const [m, rest] = await turnReadStun(cr, buf);
                 buf = rest;
-                if (!m) { closeAll(); return; }
+                // 控制连接读不到/解析失败：只停止续期，不主动关闭隧道（与原版行为一致）
+                if (!m) { if (refreshTimer) clearInterval(refreshTimer); refreshTimer = 0; return; }
                 const isErr = (m.type & 0x0110) === 0x0110;
                 if (isErr && turnParseErr(m.attrs[TURN_AT.ERR]) === 438 && m.attrs[TURN_AT.NONCE] && key) {
                     aa = [
@@ -3120,11 +3121,11 @@ async function connect2Turn(proxyConfig, targetHost, targetPort, initialData) {
                     ];
                     await sendRefresh();
                 } else if (isErr) {
+                    // 续期被拒：记录日志，不断开现有隧道
                     console.log('[turn] refresh error', turnParseErr(m.attrs[TURN_AT.ERR]));
-                    closeAll(); return;
                 }
             }
-        })().catch(() => closeAll());
+        })().catch(() => {});
 
         const readable = new ReadableStream({
             start(c) {
