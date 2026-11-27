@@ -1822,10 +1822,12 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
         const rs = remoteConnWrapper.socket;
         remoteConnWrapper.socket = null;
         closeSocketQuietly(rs);
+        try { udpRelay && udpRelay.close(); } catch (e) {}
     };
     serverSock.addEventListener('close', cleanupRemote);
     serverSock.addEventListener('error', cleanupRemote);
     let isDnsQuery = false;
+    let udpHandler = null, udpRelay = null;
     let isTrojan = false;
     let isTrojanUdp = false;
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
@@ -1900,6 +1902,7 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
 
     readable.pipeTo(new WritableStream({
         async write(chunk) {
+            if (udpHandler) return udpHandler.feed(chunk);
             if (isTrojanUdp) return await forwardTrojanUdpDns(chunk, serverSock);
             if (isDnsQuery) return await forwardataudp(chunk, serverSock, null, ssInstance);
             // 已建立连接，或正在切换反代（数据先入队，切换完成后发出）
@@ -1980,8 +1983,25 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
             if (!activeConfig.disablevless) {
                 vlsResult = parseVLsPacketHeader(chunk, activeConfig.yourUUID, yourUUIDBytes);
                 if (!vlsResult.hasError) {
-                    const { addressType, port, hostname, rawIndex, version, isUDP } = vlsResult;
+                    const { addressType, port, hostname, rawIndex, version, isUDP, isMux } = vlsResult;
 
+                    // 落地为 TURN 时，UDP 通过 TURN UDP 中继转发（DNS 53 仍走 DoH）
+                    if (isUDP && !(port === 53 && !isMux)) {
+                        const turnCfg = (() => { const c = customProxyIP ? parsePryAddress(customProxyIP) : null; return c && c.type === 'turn' ? c : null; })();
+                        if (!turnCfg) throw new Error('UDP is not supported');
+                        const respHeader = new Uint8Array([version[0], 0]);
+                        const session = await turnUdpSession(turnCfg, (ip, pt, d) => session && session.onData && session.onData(ip, pt, d));
+                        udpRelay = session;
+                        if (isMux) {
+                            if (serverSock.readyState === WS_READY_STATE_OPEN) serverSock.send(respHeader);
+                            udpHandler = makeXudp(session, serverSock);
+                        } else {
+                            udpHandler = makeVlessUdpPlain(session, serverSock, respHeader, hostname, port);
+                        }
+                        const rest = chunk.slice(rawIndex);
+                        if (rest.byteLength) udpHandler.feed(rest);
+                        return;
+                    }
 
                     if (isUDP) {
                         if (port === 53) isDnsQuery = true;
@@ -2003,6 +2023,17 @@ async function handleVlsRequest(request, customProxyIP, validSSPath, config) {
                 if (!trojanResult.hasError) {
                     isTrojan = true;
                     const { addressType, port, hostname, rawClientData, isUDP } = trojanResult;
+                    // 落地为 TURN 时，Trojan UDP 通过 TURN UDP 中继转发（DNS 53 仍走 DoH）
+                    if (isUDP) {
+                        const turnCfg = (() => { const c = customProxyIP ? parsePryAddress(customProxyIP) : null; return c && c.type === 'turn' ? c : null; })();
+                        if (turnCfg) {
+                            const session = await turnUdpSession(turnCfg, (ip, pt, d) => session && session.onData && session.onData(ip, pt, d));
+                            udpRelay = session;
+                            udpHandler = makeTrojanUdp(session, serverSock);
+                            if (rawClientData && rawClientData.byteLength) udpHandler.feed(rawClientData);
+                            return;
+                        }
+                    }
                     if (isUDP) {
                         if (port === 53) {
                             isTrojanUdp = true;
@@ -2873,8 +2904,8 @@ async function connect2Sstp(proxyConfig, targetHost, targetPort, initialData) {
 
 // ------------------------- TURN (RFC 5766 / RFC 6062) 落地代理 -------------------------
 const TURN_MAGIC = new Uint8Array([0x21, 0x12, 0xA4, 0x42]);
-const TURN_MT = { AQ: 0x003, AO: 0x103, AE: 0x113, PQ: 0x008, PO: 0x108, CQ: 0x00A, CO: 0x10A, BQ: 0x00B, BO: 0x10B, RQ: 0x004, RO: 0x104 };
-const TURN_AT = { USER: 0x006, MI: 0x008, ERR: 0x009, PEER: 0x012, REALM: 0x014, NONCE: 0x015, TRANSPORT: 0x019, CONNID: 0x02A, LIFETIME: 0x00D };
+const TURN_MT = { AQ: 0x003, AO: 0x103, AE: 0x113, PQ: 0x008, PO: 0x108, CQ: 0x00A, CO: 0x10A, BQ: 0x00B, BO: 0x10B, RQ: 0x004, RO: 0x104, SI: 0x016, DI: 0x017 };
+const TURN_AT = { USER: 0x006, MI: 0x008, ERR: 0x009, PEER: 0x012, REALM: 0x014, NONCE: 0x015, TRANSPORT: 0x019, CONNID: 0x02A, LIFETIME: 0x00D, DATA: 0x013 };
 
 const turnCat = (...a) => {
     const r = new Uint8Array(a.reduce((s, x) => s + x.length, 0));
@@ -3165,6 +3196,287 @@ async function connect2Turn(proxyConfig, targetHost, targetPort, initialData) {
     }
 }
 
+
+// ------------------------- TURN UDP 中继 (QUIC / 游戏 / 语音) -------------------------
+// 单条 TCP(或 TLS) 控制连接上申请 UDP 中继，用 Send/Data Indication 收发数据报
+const turnParseXorPeer = d => (d && d.length >= 8 && d[1] === 1)
+    ? [Array.from(TURN_MAGIC, (m, i) => d[4 + i] ^ m).join('.'), (((d[2] << 8) | d[3]) ^ 0x2112)]
+    : ['', 0];
+
+async function turnUdpSession(proxyConfig, onData) {
+    const { host, username: user, password: pass } = proxyConfig;
+    const sockCfg = { host, port: proxyConfig.port || (proxyConfig.tls ? 5349 : 3478), tls: !!proxyConfig.tls, insecure: !!proxyConfig.insecure, sni: proxyConfig.sni || '' };
+    const sock = await turnOpenSocket(sockCfg);
+    const w = sock.writable.getWriter();
+    const r = sock.readable.getReader();
+    const tid = () => crypto.getRandomValues(new Uint8Array(12));
+    const tp = new Uint8Array([17, 0, 0, 0]);
+    let closed = false, timer = 0, key = null, aa = [], realm = '';
+    const close = () => {
+        if (closed) return;
+        closed = true;
+        if (timer) clearInterval(timer);
+        try { sock.close(); } catch (e) {}
+    };
+    try {
+        await w.write(turnStunMsg(TURN_MT.AQ, tid(), [turnStunAttr(TURN_AT.TRANSPORT, tp)]));
+        let [m, buf] = await withTimeout(turnReadStun(r), 8000, 'TURN UDP allocate timeout');
+        if (m && m.type === TURN_MT.AE && user && turnParseErr(m.attrs[TURN_AT.ERR]) === 401) {
+            realm = new TextDecoder().decode(m.attrs[TURN_AT.REALM] ?? new Uint8Array(0));
+            key = await turnMd5(`${user}:${realm}:${pass}`);
+            aa = [
+                turnStunAttr(TURN_AT.USER, new TextEncoder().encode(user)),
+                turnStunAttr(TURN_AT.REALM, new TextEncoder().encode(realm)),
+                turnStunAttr(TURN_AT.NONCE, m.attrs[TURN_AT.NONCE] ?? new Uint8Array(0))
+            ];
+            await w.write(await turnAddIntegrity(turnStunMsg(TURN_MT.AQ, tid(), [turnStunAttr(TURN_AT.TRANSPORT, tp), ...aa]), key));
+            [m, buf] = await withTimeout(turnReadStun(r, buf), 8000, 'TURN UDP allocate timeout');
+        }
+        if (!m || m.type !== TURN_MT.AO) {
+            throw new Error('TURN UDP allocate failed' + (m ? ` (${turnParseErr(m.attrs[TURN_AT.ERR])})` : ''));
+        }
+
+        const sign = msg => (key ? turnAddIntegrity(msg, key) : Promise.resolve(msg));
+        const perms = new Set();
+        let wq = Promise.resolve();
+        // 所有写入串行：保证 CreatePermission 先于对应的 Send Indication 到达服务器
+        const enqueue = fn => (wq = wq.then(fn).catch(() => close()));
+        const permMsgs = ips => Promise.all(ips.map(ip => sign(turnStunMsg(TURN_MT.PQ, tid(), [turnStunAttr(TURN_AT.PEER, turnXorPeer(ip, 0)), ...aa]))));
+        const refresh = () => enqueue(async () => {
+            if (closed) return;
+            const lt = new Uint8Array(4); new DataView(lt.buffer).setUint32(0, 600);
+            const rm = await sign(turnStunMsg(TURN_MT.RQ, tid(), [turnStunAttr(TURN_AT.LIFETIME, lt), ...aa]));
+            const pm = perms.size ? await permMsgs([...perms]) : [];
+            await w.write(turnCat(rm, ...pm));
+        });
+        timer = setInterval(refresh, TURN_REFRESH_MS);
+
+        (async () => {
+            while (!closed) {
+                const [msg, rest] = await turnReadStun(r, buf);
+                buf = rest;
+                if (!msg) break;
+                if (msg.type === TURN_MT.DI && msg.attrs[TURN_AT.PEER] && msg.attrs[TURN_AT.DATA]) {
+                    const [ip, pt] = turnParseXorPeer(msg.attrs[TURN_AT.PEER]);
+                    try { onData(ip, pt, msg.attrs[TURN_AT.DATA]); } catch (e) {}
+                } else if ((msg.type & 0x0110) === 0x0110) {
+                    const code = turnParseErr(msg.attrs[TURN_AT.ERR]);
+                    if (code === 438 && msg.attrs[TURN_AT.NONCE] && key) {
+                        aa[2] = turnStunAttr(TURN_AT.NONCE, msg.attrs[TURN_AT.NONCE]);
+                        refresh();
+                    } else {
+                        console.log('[turn-udp] error', code);
+                    }
+                }
+            }
+            close();
+        })().catch(() => close());
+
+        return {
+            send(ip, port, data) {
+                if (closed || !ip) return;
+                enqueue(async () => {
+                    const parts = [];
+                    if (!perms.has(ip)) { perms.add(ip); parts.push(...(await permMsgs([ip]))); }
+                    parts.push(turnStunMsg(TURN_MT.SI, tid(), [turnStunAttr(TURN_AT.PEER, turnXorPeer(ip, port)), turnStunAttr(TURN_AT.DATA, data)]));
+                    await w.write(turnCat(...parts));
+                });
+            },
+            close,
+            get closed() { return closed; }
+        };
+    } catch (e) {
+        close();
+        throw e;
+    }
+}
+
+const isFakeIp = h => /^198\.(1[89])\./.test(h);
+function udpTargetIp(host) {
+    const h = String(host).replace(/^\[|\]$/g, '');
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) return Promise.resolve(isFakeIp(h) ? null : h);
+    if (h.includes(':')) return Promise.resolve(null); // 暂不支持 IPv6 目标
+    return resolveDnsA(h);
+}
+
+// VLESS UDP (cmd=2)：单目标，数据为 [len(2)][payload] 序列
+function makeVlessUdpPlain(session, ws, respHeader, host, port) {
+    let header = respHeader, buf = new Uint8Array(0);
+    const ipP = udpTargetIp(host);
+    session.onData = (ip, pt, data) => {
+        if (ws.readyState !== WS_READY_STATE_OPEN) return;
+        const h = header ? header.length : 0;
+        const out = new Uint8Array(h + 2 + data.length);
+        if (header) { out.set(header, 0); header = null; }
+        out[h] = data.length >> 8; out[h + 1] = data.length & 0xff;
+        out.set(data, h + 2);
+        ws.send(out);
+    };
+    return {
+        feed(chunk) {
+            const c = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+            const nb = new Uint8Array(buf.length + c.length); nb.set(buf); nb.set(c, buf.length); buf = nb;
+            while (buf.length >= 2) {
+                const len = (buf[0] << 8) | buf[1];
+                if (buf.length < 2 + len) break;
+                const pkt = buf.slice(2, 2 + len);
+                buf = buf.subarray(2 + len);
+                ipP.then(ip => ip && session.send(ip, port, pkt));
+            }
+        }
+    };
+}
+
+// XUDP (VLESS cmd=3 / Mux.Cool)：多目标，按 sessionID 区分
+function xudpReadAddr(m, o) {
+    const t = m[o];
+    if (t === 1 && m.length >= o + 5) return [Array.from(m.subarray(o + 1, o + 5)).join('.'), t];
+    if (t === 2 && m.length >= o + 2 + m[o + 1]) return [new TextDecoder().decode(m.subarray(o + 2, o + 2 + m[o + 1])), t];
+    if (t === 3 && m.length >= o + 17) {
+        const g = []; for (let i = 0; i < 8; i++) g.push(((m[o + 1 + i * 2] << 8) | m[o + 2 + i * 2]).toString(16));
+        return [g.join(':'), t];
+    }
+    return ['', 0];
+}
+function makeXudp(session, ws) {
+    let buf = new Uint8Array(0);
+    const sessions = new Map();   // sid -> { host, port, ipP }
+    const reverse = new Map();    // "ip:port" -> sid
+    const enc = new TextEncoder();
+    session.onData = (ip, pt, data) => {
+        if (ws.readyState !== WS_READY_STATE_OPEN) return;
+        const sid = reverse.get(`${ip}:${pt}`);
+        if (sid === undefined) return;
+        const s = sessions.get(sid);
+        // 地址：优先返回客户端请求的原始地址，便于客户端对应会话
+        let addr;
+        const h = s ? s.host : ip;
+        if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) addr = new Uint8Array([1, ...h.split('.').map(Number)]);
+        else { const e = enc.encode(h); addr = new Uint8Array(2 + e.length); addr[0] = 2; addr[1] = e.length; addr.set(e, 2); }
+        const port = s ? s.port : pt;
+        const metaLen = 7 + addr.length;
+        const out = new Uint8Array(2 + metaLen + 2 + data.length);
+        out[0] = metaLen >> 8; out[1] = metaLen & 0xff;
+        out[2] = sid >> 8; out[3] = sid & 0xff;
+        out[4] = 2; out[5] = 1; out[6] = 2; out[7] = port >> 8; out[8] = port & 0xff;
+        out.set(addr, 9);
+        const o = 2 + metaLen;
+        out[o] = data.length >> 8; out[o + 1] = data.length & 0xff;
+        out.set(data, o + 2);
+        ws.send(out);
+    };
+    return {
+        feed(chunk) {
+            const c = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+            const nb = new Uint8Array(buf.length + c.length); nb.set(buf); nb.set(c, buf.length); buf = nb;
+            for (;;) {
+                if (buf.length < 2) break;
+                const metaLen = (buf[0] << 8) | buf[1];
+                let end = 2 + metaLen;
+                if (metaLen < 4 || buf.length < end) break;
+                const meta = buf.subarray(2, end);
+                const sid = (meta[0] << 8) | meta[1], status = meta[2], opt = meta[3];
+                let data = null;
+                if (opt & 1) {
+                    if (buf.length < end + 2) break;
+                    const dl = (buf[end] << 8) | buf[end + 1];
+                    if (buf.length < end + 2 + dl) break;
+                    data = buf.slice(end + 2, end + 2 + dl);
+                    end += 2 + dl;
+                }
+                if ((status === 1 || status === 2) && metaLen > 7) {
+                    const network = meta[4], port = (meta[5] << 8) | meta[6];
+                    const [h] = xudpReadAddr(meta, 7);
+                    if (h && network === 2) {
+                        let s = sessions.get(sid);
+                        if (!s || s.host !== h || s.port !== port) {
+                            s = { host: h, port, ipP: udpTargetIp(h) };
+                            sessions.set(sid, s);
+                            s.ipP.then(ip => { if (ip) reverse.set(`${ip}:${port}`, sid); });
+                        }
+                    }
+                } else if (status === 3) {
+                    sessions.delete(sid);
+                }
+                buf = buf.subarray(end);
+                const s = sessions.get(sid);
+                if (data && data.length && s) {
+                    const port = s.port;
+                    s.ipP.then(ip => { if (ip) { reverse.set(`${ip}:${port}`, sid); session.send(ip, port, data); } });
+                }
+            }
+        }
+    };
+}
+
+
+// Trojan UDP：帧格式 [ATYP][ADDR][PORT(2)][LEN(2)][CRLF][PAYLOAD]，一个连接可发往多个目标
+function makeTrojanUdp(session, ws) {
+    let buf = new Uint8Array(0);
+    const targets = new Map();  // "host:port" -> ipPromise
+    const reverse = new Map();  // "ip:port" -> addrHeader(原始请求地址)
+    const sendBack = (addrHeader, data) => {
+        if (ws.readyState !== WS_READY_STATE_OPEN) return;
+        const out = new Uint8Array(addrHeader.length + 4 + data.length);
+        out.set(addrHeader, 0);
+        out[addrHeader.length] = data.length >> 8;
+        out[addrHeader.length + 1] = data.length & 0xff;
+        out[addrHeader.length + 2] = 0x0d;
+        out[addrHeader.length + 3] = 0x0a;
+        out.set(data, addrHeader.length + 4);
+        ws.send(out);
+    };
+    session.onData = (ip, pt, data) => {
+        let h = reverse.get(`${ip}:${pt}`);
+        if (!h) {
+            h = new Uint8Array(7); h[0] = 1;
+            ip.split('.').forEach((v, i) => { h[1 + i] = +v; });
+            h[5] = pt >> 8; h[6] = pt & 0xff;
+        }
+        sendBack(h, data);
+    };
+    return {
+        feed(chunk) {
+            const c = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+            const nb = new Uint8Array(buf.length + c.length); nb.set(buf); nb.set(c, buf.length); buf = nb;
+            for (;;) {
+                if (buf.length < 1) break;
+                const atyp = buf[0];
+                let alen;
+                if (atyp === 1) alen = 7;
+                else if (atyp === 3) { if (buf.length < 2) break; alen = 4 + buf[1]; }
+                else if (atyp === 4) alen = 19;
+                else { buf = new Uint8Array(0); break; }
+                if (buf.length < alen + 4) break;
+                const plen = (buf[alen] << 8) | buf[alen + 1];
+                const end = alen + 4 + plen;
+                if (buf.length < end) break;
+                const addrHeader = buf.slice(0, alen);
+                const payload = buf.slice(alen + 4, end);
+                buf = buf.subarray(end);
+                const port = (addrHeader[alen - 2] << 8) | addrHeader[alen - 1];
+                let host;
+                if (atyp === 1) host = Array.from(addrHeader.subarray(1, 5)).join('.');
+                else if (atyp === 3) host = new TextDecoder().decode(addrHeader.subarray(2, 2 + addrHeader[1]));
+                else { const g = []; for (let i = 0; i < 8; i++) g.push(((addrHeader[1 + i * 2] << 8) | addrHeader[2 + i * 2]).toString(16)); host = g.join(':'); }
+                if (port === 53 && payload.length >= 12) {
+                    // DNS 仍走 DoH
+                    resolveRawDnsWire(payload).then(ans => { if (ans) sendBack(addrHeader, new Uint8Array(ans)); }).catch(() => {});
+                    continue;
+                }
+                const k = `${host}:${port}`;
+                let ipP = targets.get(k);
+                if (!ipP) { ipP = udpTargetIp(host); targets.set(k, ipP); }
+                ipP.then(ip => {
+                    if (!ip) return;
+                    reverse.set(`${ip}:${port}`, addrHeader);
+                    session.send(ip, port, payload);
+                });
+            }
+        }
+    };
+}
+
 async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, customProxyIP, request, ssInstance) {
     const connector = getSocketConnector(request);
     async function writeInitial(sock, data) {
@@ -3321,6 +3633,9 @@ function parseVLsPacketHeader(chunk, token, tokenBytes) {
         if (formatIdentifier(chunkView.slice(1, 17)) !== token) return { hasError: true, message: 'Invalid uuid' };
     }
     const optLen = chunkView[17];
+    if (chunkView.byteLength >= 19 + optLen && chunkView[18 + optLen] === 3) {
+        return { hasError: false, isMux: true, rawIndex: 19 + optLen, version, port: 0, hostname: '', addressType: 0, isUDP: true };
+    }
     if (chunkView.byteLength < 22 + optLen) return { hasError: true, message: 'Truncated VLESS header' };
     const cmd = chunkView[18 + optLen];
     let isUDP = false;
